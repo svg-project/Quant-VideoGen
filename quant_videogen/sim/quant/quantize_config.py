@@ -24,3 +24,25 @@ class QuantizeConfig:
     # PRQ (nstages-kmeans) specific parameters
     num_prq_stages: int = 4
     """Number of PRQ stages for nstages-kmeans quantization."""
+
+    asymmetric: bool = False
+    """KIVI-style asymmetric residual quantization (per-block min-max + zero
+    point) instead of symmetric absmax. Symmetric int2 only uses {-1, 0, 1},
+    i.e. 3 of 4 codes; asymmetric spans the full [0, 2**n - 1] range at the
+    cost of storing a zero point next to each scale. Ablated on LingBot-v2
+    (16 videos, block64-symmetric vs block128-asymmetric at equal overhead):
+    the two tie within noise end-to-end, so symmetric stays the default."""
+
+    # ---- Chunk-level quantization policy (see experiments/LingBot-v2) ----
+    quant_factor: int = 8
+    """Quantize the previous `quant_factor` chunks once every `quant_factor`
+    chunks (Self-Forcing QUANT_FACTOR convention). 1 == quantize every chunk."""
+
+    quant_keep_recent_chunks: int = 0
+    """Completed chunks held in BF16 before quantization reaches them, so the
+    chunk being denoised always attends to clean recent history."""
+
+    quant_sink_keep_chunks: int = 0
+    """Leading attention-sink chunks never quantized. The first sink chunk holds
+    the initial conditioning frame that every later chunk attends to forever, so
+    a permanent low-bit error there is the costliest one; 1 is recommended."""

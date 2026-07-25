@@ -18,7 +18,8 @@ def prq_quant(
     tol: float = 1e-4,
     PACK_OUTPUT_INT8: bool = False,
     CLUSTER_ID_INT8: bool = False,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor]:
+    asymmetric: bool = False,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Multi-stage KMeans quantization pipeline.
 
@@ -48,6 +49,7 @@ def prq_quant(
                           the cluster assignments from each stage.
         residual_quant: Quantized final residual tensor.
         scales: Scale factors from quantization.
+        zeros: Per-block zero-points (KIVI-style) when asymmetric, else None.
     """
     B, H, S, D = x.shape
     BH = B * H
@@ -82,15 +84,16 @@ def prq_quant(
         residual = minus_centroid(residual, cluster_ids, centroids)
 
     # Quantize final residual
-    residual_quant, scales = quant_pack(
+    residual_quant, scales, zeros = quant_pack(
         residual,
         block_size=block_size,
         num_bits=num_bits,
         scale_precision=scale_precision,
         pack_output_int8=PACK_OUTPUT_INT8,
+        asymmetric=asymmetric,
     )
-    
-    return centroids_list, cluster_ids_list, residual_quant, scales
+
+    return centroids_list, cluster_ids_list, residual_quant, scales, zeros
 
 
 def prq_dequant(
@@ -103,6 +106,7 @@ def prq_dequant(
     PACK_INPUT_INT8: bool = False,
     CLUSTER_ID_INT8: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    zeros: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Dequantize and reconstruct tensor from multi-stage KMeans quantization.
@@ -136,4 +140,5 @@ def prq_dequant(
         PACK_INPUT_INT8=PACK_INPUT_INT8,
         CLUSTER_ID_INT8=CLUSTER_ID_INT8,
         output_dtype=output_dtype,
+        zeros=zeros,
     )

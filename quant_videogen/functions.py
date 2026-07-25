@@ -268,6 +268,7 @@ def triton_prq_quantize_tensor(
     use_percentile_clipping: bool = False,
     percentile: float = 99.0,
     quantize_fn=None,
+    asymmetric: bool = False,
 ) -> dict:
     """
     Apply Triton-based N-stage K-Means quantization to a tensor.
@@ -313,7 +314,7 @@ def triton_prq_quantize_tensor(
             target_max=TARGET_MAX,
         )
 
-    centroids_list, cluster_ids_list, residual_quant, scales = prq_quant(
+    centroids_list, cluster_ids_list, residual_quant, scales, zeros = prq_quant(
         tensor.contiguous(),
         n_stages=num_stages,
         n_clusters=num_clusters,
@@ -323,6 +324,7 @@ def triton_prq_quantize_tensor(
         max_iters=max_iters,
         PACK_OUTPUT_INT8=True,
         CLUSTER_ID_INT8=True,
+        asymmetric=asymmetric,
     )
 
     if use_percentile_clipping:
@@ -331,6 +333,7 @@ def triton_prq_quantize_tensor(
             "cluster_ids_list": cluster_ids_list,
             "residual_quant": residual_quant,
             "scales": scales,
+            "zeros": zeros,
             "residual": residual,
             "scale_factor": scale_factor,
         }
@@ -340,6 +343,7 @@ def triton_prq_quantize_tensor(
             "cluster_ids_list": cluster_ids_list,
             "residual_quant": residual_quant,
             "scales": scales,
+            "zeros": zeros,
         }
 
     # dequantized_tensor = prq_dequant(
@@ -399,6 +403,7 @@ def triton_prq_dequantize_tensor(
         PACK_INPUT_INT8=True,
         CLUSTER_ID_INT8=True,
         output_dtype=output_dtype,
+        zeros=packed_state.get("zeros"),
     )
 
     if packed_state.get("residual", None) is not None:

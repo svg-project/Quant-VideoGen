@@ -13,9 +13,19 @@ def get_configs():
                     )
     return configs
 
+def _prune_configs(configs, named_args, **kwargs):
+    # The kernel reshapes BLOCK_D elements to (BLOCK_D // Q_BLOCK_SIZE, Q_BLOCK_SIZE),
+    # so BLOCK_D must be a positive multiple of the quantization block size
+    # (e.g. Q_BLOCK_SIZE=128 makes the BLOCK_D=64 config uncompilable).
+    q_block_size = named_args["Q_BLOCK_SIZE"]
+    pruned = [c for c in configs if c.kwargs["BLOCK_D"] % q_block_size == 0]
+    return pruned or configs
+
+
 @triton.autotune(
     configs=get_configs(),
     key=["N", "D"],
+    prune_configs_by={"early_config_prune": _prune_configs},
 )
 @triton.heuristics(
     values={
@@ -28,6 +38,7 @@ def _quant_pack_kernel(
     X_ptr,
     Y_ptr,
     SY_ptr,
+    ZY_ptr,
     D: tl.constexpr,
     SCALE_D: tl.constexpr,
     D_AFTER_PACK: tl.constexpr,
@@ -35,6 +46,7 @@ def _quant_pack_kernel(
     SCALE_IS_E4M3: tl.constexpr,
     Q_BLOCK_SIZE: tl.constexpr, # quantization block size
     PACK_OUTPUT_INT8: tl.constexpr,
+    ASYMMETRIC: tl.constexpr,  # KIVI-style min-max quant with zero-point
     # Autotune
     BLOCK_D: tl.constexpr,
     SCALE_BLOCK_D: tl.constexpr,
@@ -64,21 +76,37 @@ def _quant_pack_kernel(
     # Integer Quantization
     x = x.to(tl.float32)
     x = tl.reshape(x, (SCALE_BLOCK_D, Q_BLOCK_SIZE))
-    abs_x = tl.abs(x)
-    max_x = tl.max(abs_x, axis=1, keep_dims=True)
 
     max_int_value = 2**(n_bits - 1) - 1
-    scale_x = max_x / max_int_value
-    scale_x = tl.maximum(scale_x, 1e-10)
-    
-    # If the scaling factor is also being quantized to E4M3
-    if SCALE_IS_E4M3:
-        scale_x = scale_x.to(tl.float8e4nv)
-    
-    # Float Quantization
-    y = x / scale_x
-    y = libdevice.round(y)
-    y = tl.clamp(y, min=-max_int_value, max=max_int_value)
+    if ASYMMETRIC:
+        # KIVI-style: per-block [min, max] mapped onto the full unsigned range
+        # [0, 2^n - 1]; stores a zero-point (the block min) next to the scale.
+        qmax = 2**n_bits - 1
+        min_x = tl.min(x, axis=1, keep_dims=True)
+        max_x = tl.max(x, axis=1, keep_dims=True)
+        scale_x = (max_x - min_x) / qmax
+        scale_x = tl.maximum(scale_x, 1e-10)
+        zero_x = min_x
+        if SCALE_IS_E4M3:
+            scale_x = scale_x.to(tl.float8e4nv)
+            zero_x = zero_x.to(tl.float8e4nv)
+        y = (x - zero_x.to(tl.float32)) / scale_x.to(tl.float32)
+        y = libdevice.round(y)
+        y = tl.clamp(y, min=0, max=qmax)
+    else:
+        abs_x = tl.abs(x)
+        max_x = tl.max(abs_x, axis=1, keep_dims=True)
+        scale_x = max_x / max_int_value
+        scale_x = tl.maximum(scale_x, 1e-10)
+
+        # If the scaling factor is also being quantized to E4M3
+        if SCALE_IS_E4M3:
+            scale_x = scale_x.to(tl.float8e4nv)
+
+        # Float Quantization
+        y = x / scale_x
+        y = libdevice.round(y)
+        y = tl.clamp(y, min=-max_int_value, max=max_int_value)
     
     # Deal with output shape
     y = tl.reshape(y, (BLOCK_D))
@@ -87,15 +115,18 @@ def _quant_pack_kernel(
     scale_x = scale_x.to(SY_ptr.dtype.element_ty)
     
     # Pack output into int8 if needed
+    # (asymmetric codes are already unsigned in [0, 2^n - 1]: no offset needed)
     if PACK_OUTPUT_INT8:
         if n_bits == 4:
-            y = y + max_int_value
+            if not ASYMMETRIC:
+                y = y + max_int_value
             y = tl.reshape(y, (BLOCK_D // 2, 2))
             y1, y2 = tl.split(y)
             y_new = y1 << 4 | y2
             y = y_new
         elif n_bits == 2:
-            y = y + max_int_value
+            if not ASYMMETRIC:
+                y = y + max_int_value
             y = tl.reshape(y, (BLOCK_D // 2, 2))
             y13, y24 = tl.split(y)
             
@@ -117,6 +148,12 @@ def _quant_pack_kernel(
     
     scale_y_ptr = SY_ptr + pid_s * SCALE_D + offset_scale_d
     tl.store(scale_y_ptr, scale_x, mask=mask_scale_d)
+
+    if ASYMMETRIC:
+        zero_x = tl.reshape(zero_x, (SCALE_BLOCK_D))
+        zero_x = zero_x.to(ZY_ptr.dtype.element_ty)
+        zero_y_ptr = ZY_ptr + pid_s * SCALE_D + offset_scale_d
+        tl.store(zero_y_ptr, zero_x, mask=mask_scale_d)
     
 
 def quant_pack(
@@ -125,7 +162,8 @@ def quant_pack(
     num_bits: int,
     scale_precision: torch.dtype,
     pack_output_int8: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    asymmetric: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Quantize input tensor with block-wise scaling.
 
@@ -139,10 +177,15 @@ def quant_pack(
         num_bits: The number of bits for quantization.
         scale_precision: The dtype for storing scale factors. Must be bfloat16 or float8_e4m3fn.
         pack_output_int8: If True, pack the output into int8. In this case, num_bits must be 2 or 4.
-        
+        asymmetric: If True, use KIVI-style min-max quantization with a per-block
+            zero-point, using the full unsigned range [0, 2^num_bits - 1]
+            (symmetric absmax wastes one level, e.g. int2 only uses {-1,0,1}).
+
     Returns:
         x_quant: Quantized tensor.
         scales: Scale factors with dtype `scale_precision`, shape (..., D // block_size).
+        zeros: Per-block zero-points (same shape/dtype as scales) when asymmetric,
+            else None.
     """
     assert num_bits in (2, 3, 4, 8), "num_bits must be 2, 3, 4, or 8"
     assert scale_precision in (torch.bfloat16, torch.float8_e4m3fn), "scale_precision must be bfloat16 or float8_e4m3fn"
@@ -170,23 +213,30 @@ def quant_pack(
         y = torch.zeros(B * S, HD, device=x.device, dtype=torch.int8)
         HD_AFTER_PACK = HD
     scales = torch.zeros(B * S, HSCALE_D, device=x.device, dtype=scale_precision)
+    zeros = (
+        torch.zeros(B * S, HSCALE_D, device=x.device, dtype=scale_precision)
+        if asymmetric
+        else scales  # dummy pointer, kernel never stores when ASYMMETRIC=False
+    )
 
     grid = lambda meta: (B * S, triton.cdiv(HD, meta["BLOCK_D"]))
     _quant_pack_kernel[grid](
-        x, y, scales, HD, HSCALE_D, HD_AFTER_PACK, num_bits, SCALE_IS_E4M3, block_size, PACK_OUTPUT_INT8)
-    
+        x, y, scales, zeros, HD, HSCALE_D, HD_AFTER_PACK, num_bits, SCALE_IS_E4M3, block_size, PACK_OUTPUT_INT8, asymmetric)
+
     # Reshape to original shape
     if PACK_OUTPUT_INT8:
         y = y.reshape(B, S, H, D // elem_per_int).permute(0, 2, 1, 3)
     else:
         y = y.reshape(B, S, H, D).permute(0, 2, 1, 3)
     scales = scales.reshape(B, S, H, SCALE_D).permute(0, 2, 1, 3)
-    
-    return y, scales
+    if not asymmetric:
+        return y, scales, None
+    zeros = zeros.reshape(B, S, H, SCALE_D).permute(0, 2, 1, 3)
+    return y, scales, zeros
 
 
 if __name__ == "__main__":
     x = torch.randn(1, 4, 1, 128, device="cuda").to(torch.bfloat16)
-    y, scales = quant_pack(x, block_size=16, num_bits=4, scale_precision=torch.float8_e4m3fn, pack_output_int8=True)
+    y, scales, _ = quant_pack(x, block_size=16, num_bits=4, scale_precision=torch.float8_e4m3fn, pack_output_int8=True)
     print(y)
     print(scales)
