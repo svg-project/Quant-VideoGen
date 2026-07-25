@@ -218,6 +218,46 @@ class ChunkedKVCache:
             })
 
     # ------------------------------------------------------------------
+    # Sliding-window eviction
+    # ------------------------------------------------------------------
+
+    def evict_range(self, free_start_index: int, free_end_index: int):
+        """Free storage for the token span ``[free_start_index, free_end_index)``
+        that has slid out of the attention window.
+
+        * BF16 chunks fully inside the freed span are released (set to ``None``).
+        * A **quantized span** is dropped — releasing its centroids *and* its
+          per-token data — **only if every chunk it covers lies inside the
+          freed span**.  A span that still overlaps a live region (e.g. its
+          most-recent frames are still in the window) is kept **intact**, so its
+          shared centroids remain valid for the surviving tokens.  This is the
+          "keep the centroid until all of its chunks are evicted" rule.
+
+        No data is moved: chunks stay at their absolute positions, so quantized
+        spans are never re-materialized to BF16 by eviction.
+        """
+        sc = self._token_to_chunk(free_start_index)
+        ec = self._token_to_chunk(free_end_index)
+
+        # Release BF16 chunks that fall entirely inside the freed span.
+        for ci in range(sc, ec):
+            if self.chunk_state[ci] == ChunkState.BF16:
+                self.chunks[ci] = None
+                self.chunk_state[ci] = ChunkState.EMPTY
+
+        # Drop only the quantized spans that are fully contained in the freed
+        # span; keep partially-live spans (centroids stay resident).
+        survivors: list[dict] = []
+        for span in self.quantized_spans:
+            if sc <= span["start_chunk"] and span["end_chunk"] <= ec:
+                for ci in range(span["start_chunk"], span["end_chunk"]):
+                    self.chunks[ci] = None
+                    self.chunk_state[ci] = ChunkState.EMPTY
+            else:
+                survivors.append(span)
+        self.quantized_spans = survivors
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
