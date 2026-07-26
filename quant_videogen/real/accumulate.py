@@ -27,6 +27,7 @@ def get_configs():
 def _nstage_accum_kernel(
     residual_quant_ptr,
     scales_ptr,
+    zeros_ptr,
     centroids_ptr,
     cluster_ids_ptr,
     output_ptr,
@@ -41,6 +42,7 @@ def _nstage_accum_kernel(
     n_bits: tl.constexpr,
     Q_BLOCK_SIZE: tl.constexpr,
     PACK_INPUT_INT8: tl.constexpr,  # Whether input is packed into int8
+    ASYMMETRIC: tl.constexpr,  # KIVI-style: unsigned codes + per-block zero-point
     # Autotune
     BLOCK_S: tl.constexpr,
 ):
@@ -90,7 +92,8 @@ def _nstage_accum_kernel(
 
             # Join to (BLOCK_S, D_PACKED, 2) then reshape to (BLOCK_S, D)
             residual_unpacked = tl.reshape(tl.join(high, low), (BLOCK_S, D))
-            residual_unpacked = residual_unpacked - max_int_value
+            if not ASYMMETRIC:
+                residual_unpacked = residual_unpacked - max_int_value
         elif n_bits == 2:
             v1 = (residual_packed >> 6) & 0x3
             v2 = (residual_packed >> 4) & 0x3
@@ -101,7 +104,8 @@ def _nstage_accum_kernel(
             v13 = tl.reshape(v13, (BLOCK_S, D // 2))
             v24 = tl.reshape(v24, (BLOCK_S, D // 2))
             residual_unpacked = tl.reshape(tl.join(v13, v24), (BLOCK_S, D))
-            residual_unpacked = residual_unpacked - max_int_value
+            if not ASYMMETRIC:
+                residual_unpacked = residual_unpacked - max_int_value
         else:
             # n_bits == 8, packed as int8 (no bit packing, just dtype)
             residual_ptr_8 = residual_quant_ptr + pid_bh * S * D + offset_s[:, None] * D + offset_d[None, :]
@@ -127,6 +131,10 @@ def _nstage_accum_kernel(
     residual_reshaped = tl.reshape(residual_unpacked, (BLOCK_S, SCALE_D, Q_BLOCK_SIZE))
     scales_expanded = tl.reshape(scales, (BLOCK_S, SCALE_D, 1))
     residual_dequant = residual_reshaped * scales_expanded
+    if ASYMMETRIC:
+        zero_ptr = zeros_ptr + pid_bh * S * SCALE_D + offset_s[:, None] * SCALE_D + offset_scale_d[None, :]
+        zeros = tl.load(zero_ptr, mask=mask_s[:, None], other=0.0).to(tl.float32)
+        residual_dequant = residual_dequant + tl.reshape(zeros, (BLOCK_S, SCALE_D, 1))
     residual_dequant = tl.reshape(residual_dequant, (BLOCK_S, D))
     
     # Initialize accumulator
@@ -163,6 +171,7 @@ def nstage_accum(
     PACK_INPUT_INT8: bool = False,
     CLUSTER_ID_INT8: bool = False,
     output_dtype: torch.dtype = torch.bfloat16,
+    zeros: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Accumulate multi-stage KMeans centroids and quantized residual to reconstruct x.
@@ -216,6 +225,12 @@ def nstage_accum(
     
     # Scales: (B, H, S, D // block_size) -> (B*H, S, D // block_size)
     scales_flat = scales.reshape(BH, S, SCALE_D).contiguous()
+
+    # Zero-points (asymmetric/KIVI mode): same layout as scales
+    ASYMMETRIC = zeros is not None
+    zeros_flat = (
+        zeros.reshape(BH, S, SCALE_D).contiguous() if ASYMMETRIC else scales_flat
+    )  # dummy pointer when symmetric; kernel never loads it
     
     # Centroids: list of (B, H, K, D) -> concat to (B*H, N_STAGES * K, D)
     # Stack along a new dim then reshape
@@ -235,6 +250,7 @@ def nstage_accum(
     _nstage_accum_kernel[grid](
         residual_flat,
         scales_flat,
+        zeros_flat,
         centroids_flat,
         cluster_ids_flat,
         output,
@@ -247,6 +263,7 @@ def nstage_accum(
         num_bits,
         block_size,
         PACK_INPUT_INT8,
+        ASYMMETRIC,
     )
     
     # Reshape output back to (B, H, S, D)
