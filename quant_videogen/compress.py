@@ -222,6 +222,7 @@ def compress_kv_cache(k: torch.Tensor, v: torch.Tensor, quant_type: str, quant_c
         )
     elif quantize_type == QuantizeFunctions.TRITON_PRQ:
         # Apply Triton N-Stage K-Means based quantization
+        asymmetric = getattr(quant_config, "asymmetric", False)
         k_quant = triton_prq_quantize_tensor(
             k,
             num_stages=quant_config.num_prq_stages,
@@ -229,6 +230,7 @@ def compress_kv_cache(k: torch.Tensor, v: torch.Tensor, quant_type: str, quant_c
             block_size=quant_config.quant_block_size,
             max_iters=quant_config.kmeans_max_iters,
             quantize_fn=quantize_fn,
+            asymmetric=asymmetric,
         )
         v_quant = triton_prq_quantize_tensor(
             v,
@@ -237,9 +239,11 @@ def compress_kv_cache(k: torch.Tensor, v: torch.Tensor, quant_type: str, quant_c
             block_size=quant_config.quant_block_size,
             max_iters=quant_config.kmeans_max_iters,
             quantize_fn=quantize_fn,
+            asymmetric=asymmetric,
         )
     elif quantize_type == QuantizeFunctions.TRITON_PRQ_CLIP:
         # Apply Triton N-Stage K-Means based quantization
+        asymmetric = getattr(quant_config, "asymmetric", False)
         k_quant = triton_prq_quantize_tensor(
             k,
             num_stages=quant_config.num_prq_stages,
@@ -248,6 +252,7 @@ def compress_kv_cache(k: torch.Tensor, v: torch.Tensor, quant_type: str, quant_c
             max_iters=quant_config.kmeans_max_iters,
             quantize_fn=quantize_fn,
             use_percentile_clipping=True,
+            asymmetric=asymmetric,
         )
         v_quant = triton_prq_quantize_tensor(
             v,
@@ -257,6 +262,7 @@ def compress_kv_cache(k: torch.Tensor, v: torch.Tensor, quant_type: str, quant_c
             max_iters=quant_config.kmeans_max_iters,
             quantize_fn=quantize_fn,
             use_percentile_clipping=True,
+            asymmetric=asymmetric,
         )
     elif quantize_type == QuantizeFunctions.NAIVE:
         # ==========================================================
