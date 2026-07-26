@@ -727,11 +727,8 @@ class WanI2VCausal:
                                 sink_tokens = self.sink_size * frame_seqlen
                                 # Keep the leading sink chunk(s) in BF16: the first
                                 # sink chunk holds the initial conditioning frame that
-                                # every later chunk attends to forever, so a permanent
-                                # low-bit error there is the costliest one. Measured on
-                                # LingBot-v2 (16 videos, int2/int4 c128): keeping it
-                                # gains ~+15 dB PSNR in 0-2s and ~+3 dB in 2-5s for
-                                # ~9% of the whole-cache compression ratio.
+                                # every later chunk attends to, so quantization error
+                                # there never decays.
                                 sink_keep = min(
                                     (getattr(self.quant_config, "quant_sink_keep_chunks", 0)
                                      if self.quant_config else 0) * tokens_per_chunk,
@@ -1104,14 +1101,10 @@ class WanI2VCausal:
         fork_devices = [self.device] if torch.cuda.is_available() else []
         with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
             # Fix the RNG so k-means centroid init (unseeded torch.randint in
-            # kmeans_euclid) is reproducible run-to-run.
-            #
-            # fork_rng restores the global RNG state afterwards, which matters:
-            # seeding in place also resets the *generation* noise sequence, so
-            # the quantized run's trajectory drifts away from the BF16 baseline
-            # for reasons unrelated to quantization error (measured on the
-            # SGLang port: ~9 dB of spurious PSNR loss, i.e. large enough to
-            # invent "collapses" that vanish once the RNG is isolated).
+            # kmeans_euclid) is reproducible run-to-run. fork_rng restores the
+            # global RNG state afterwards: seeding in place would also reset the
+            # generation noise sequence, moving the sampling trajectory for
+            # reasons unrelated to quantization error.
             torch.manual_seed(1234)
             quantize_fn = get_quantize_fn(quant_config.quant_type, quant_config)
             for layer in self_kv_cache:
