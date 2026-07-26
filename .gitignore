@@ -39,3 +39,7 @@ Thumbs.db
 # Logs
 *.log
 wandb/
+
+# Benchmark result artifacts (regenerate with benchmark/*.py)
+benchmark/*.json
+benchmark/*.png
