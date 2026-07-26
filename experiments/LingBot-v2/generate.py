@@ -207,27 +207,20 @@ def _parse_args():
         "--quant_type", type=str, default="none",
         help="KV-cache quant type. 'none' disables. e.g. "
              "triton-nstages-kmeans-int4, triton-nstages-kmeans-int2.")
-    # Defaults below follow the 36-config x 16-video sweep in README.md:
-    # 1 stage / block 64 / 2 k-means iters, and centroids matter far less than
-    # the residual bit width (int4 tolerates c64, int2 prefers c256).
     parser.add_argument("--cache_num_k_centroids", type=int, default=256)
     parser.add_argument("--cache_num_v_centroids", type=int, default=256)
-    parser.add_argument(
-        "--kmeans_max_iters", type=int, default=2,
-        help="K-means iterations per stage. 1/2/4 differ by <1 dB PSNR once the "
-             "k-means RNG is seeded; 2 is the safe cheap default.")
+    parser.add_argument("--kmeans_max_iters", type=int, default=2)
     parser.add_argument("--quant_block_size", type=int, default=64)
     parser.add_argument(
         "--num_prq_stages", type=int, default=1,
-        help="PRQ k-means stages. 1 is enough for per-chunk quantization: extra "
-             "stages add codebook overhead per span without a quality win.")
+        help="PRQ k-means stages. Extra stages add codebook overhead per span, "
+             "which per-chunk quantization cannot amortize.")
     parser.add_argument(
         "--asymmetric", action="store_true", default=False,
-        help="KIVI-style asymmetric residual quantization (per-block min-max + "
-             "zero point) instead of symmetric absmax. Symmetric int2 only uses "
-             "{-1,0,1}; asymmetric spans the full unsigned range but needs a "
-             "zero point per block. Ties with symmetric end-to-end at equal "
-             "overhead (block64-symm vs block128-asym), so it is off by default.")
+        help="Asymmetric residual quantization (per-block min-max + zero point) "
+             "instead of symmetric absmax. Symmetric int2 only uses {-1,0,1}; "
+             "asymmetric spans the full unsigned range but stores a zero point "
+             "per block.")
     parser.add_argument(
         "--quant_factor", type=int, default=8,
         help="Quantize the previous `quant_factor` chunks once every "
@@ -240,9 +233,8 @@ def _parse_args():
     parser.add_argument(
         "--quant_sink_keep_chunks", type=int, default=0,
         help="Leading attention-sink chunks never quantized. The first sink chunk "
-             "holds the initial conditioning frame every later chunk attends to "
-             "forever: keeping it BF16 buys ~+15 dB (0-2s) / ~+3 dB (2-5s) PSNR "
-             "for ~9%% of the whole-cache ratio. 1 recommended.")
+             "holds the initial conditioning frame every later chunk attends to, "
+             "so quantization error there never decays. 1 recommended.")
     parser.add_argument(
         "--save_dir",
         type=str,
